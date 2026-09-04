@@ -8,7 +8,10 @@ type Subscription struct {
 	QoS    int    `json:"qos"`    // 0 或 1,投递时与发布 QoS 取小
 }
 
-// Will 遗嘱消息:会话异常终止时由 Broker 代为发布。
+// Will 遗嘱消息:会话异常终止(宽限期内未重连)时由 Broker 代为发布。
+// Retain=false 时 fire-and-forget;Retain=true 时驻留为保留消息(对齐 MQTT),
+// 直至被同主题新保留消息覆盖或空 payload 清除;上线状态由客户端自行发布
+// retained 消息(如 "online")维护,Broker 不自动收回。
 type Will struct {
 	Topic   string `json:"topic"`
 	Payload string `json:"payload"`

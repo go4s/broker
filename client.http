@@ -11,16 +11,16 @@
 # body 字段:
 #   client_id         string  可选,业务侧客户端标识;缺省由服务端生成
 #   clean_start       bool    可选,默认 true;false 时复用同 client_id 会话保留在服务端的订阅表
-#   will              object  可选,遗嘱消息 {topic, payload, qos, retain},会话异常终止时由 Broker 代发
+#   will              object  可选,遗嘱消息 {topic, payload, qos, retain},会话异常终止时由 Broker 代发;
+#                             retain=true 仅在 clean_start=false 时驻留为保留消息,会话恢复在线或销毁时收回
 #   will_grace_period string  可选,会话级遗嘱宽限期,如 "30s";缺省采用 Broker 预定义设置
 #   heartbeat_interval string  可选,会话级 SSE 心跳间隔,如 "3m";缺省采用会话级缺省值
 POST {{host}}/sessions
 Content-Type: application/json
 
 {
-  "client_id": "device-1",
+  "client_id": "God2",
   "clean_start": true,
-  "will": { "topic": "status/device-1", "payload": "offline", "qos": 0, "retain": true },
   "will_grace_period": "30s",
   "heartbeat_interval": "3m"
 }
@@ -55,8 +55,7 @@ Content-Type: application/json
 
 {
   "subscriptions": [
-    { "filter": "sensors/+", "qos": 1 },
-    { "filter": "alerts/#", "qos": 0 }
+    { "filter": "#", "qos": 0 }
   ]
 }
 
@@ -64,7 +63,7 @@ Content-Type: application/json
     client.assert(response.status === 200, "OK");
     // response.subscriptions: 生效后的完整订阅表(结构同上);
     // 若推送流在线,新增 filter 匹配到的保留消息会立即补发到流上(retain=true)
-    client.assert(response.body.subscriptions.length === 2, "返回完整订阅表");
+    client.assert(response.body.subscriptions.length > 0, "返回完整订阅表");
 %}
 
 ### 4. 查看订阅表

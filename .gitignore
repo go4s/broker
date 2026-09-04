@@ -34,3 +34,6 @@ go.work.sum
 *_test.go
 bin
 *.env*
+Dockerfile
+Makefile
+vendor

@@ -1,3 +1,4 @@
+tag ?= $$(git rev-parse --short HEAD)
 GO        ?= go
 SERVER    := ./example
 BINARY    := broker-server
@@ -33,3 +34,11 @@ cross:
 
 clean:
 	rm -rf $(BIN_DIR)
+
+
+image:
+	export HTTP_PROXY=http://192.168.66.170:42059																		\
+		&& export HTTPS_PROXY=http://192.168.66.170:42059																\
+		&& podman build --network host -t registry.cn-hangzhou.aliyuncs.com/etsme/etslms-broker:${tag} .
+image-push:
+	podman push registry.cn-hangzhou.aliyuncs.com/etsme/local-sms:${tag}

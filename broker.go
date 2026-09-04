@@ -416,6 +416,9 @@ func (b *Broker) resendRetainedLocked(s *Session, subs []Subscription) {
 }
 
 // onGraceExpired 遗嘱宽限期到期:发布遗嘱;cleanStart 会话销毁,否则保留订阅表待恢复。
+// 遗嘱投递规则(对齐 MQTT):retain=false 时 fire-and-forget(仅投给当前在线订阅者);
+// retain=true 时无论 clean_start 与否都驻留为保留消息,直至被同主题新保留消息覆盖
+// 或空 payload 清除——上线状态由客户端自行发布 retained 消息维护,Broker 不自动收回。
 func (b *Broker) onGraceExpired(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
