@@ -1,0 +1,151 @@
+# broker 功能 API 接口契约
+# JetBrains HTTP Client 格式。每条请求可独立执行;
+# `> {% %}` 响应脚本以断言形式描述 response 结构与字段功用,
+# 并把后续请求依赖的字段(如 session_id)存入全局变量。
+#
+# 前提:example 服务已启动(go run ./example),监听 127.0.0.1:8080。
+#
+#@host = http://127.0.0.1:8080
+
+### 1. 创建会话
+# body 字段:
+#   client_id         string  可选,业务侧客户端标识;缺省由服务端生成
+#   clean_start       bool    可选,默认 true;false 时复用同 client_id 会话保留在服务端的订阅表
+#   will              object  可选,遗嘱消息 {topic, payload, qos, retain},会话异常终止时由 Broker 代发
+#   will_grace_period string  可选,会话级遗嘱宽限期,如 "30s";缺省采用 Broker 预定义设置
+POST {{host}}/sessions
+Content-Type: application/json
+
+{
+  "client_id": "device-1",
+  "clean_start": true,
+  "will": { "topic": "status/device-1", "payload": "offline", "qos": 0, "retain": true },
+  "will_grace_period": "30s"
+}
+
+> {%
+    client.assert(response.status === 201, "创建成功返回 201");
+    // response 结构:
+    //   session_id  string  会话 ID,后续所有会话级 API 的路径参数
+    //   client_id   string  回显客户端标识
+    //   clean_start bool    回显 clean_start 生效值
+    //   resumed     bool    true 表示复用了既有会话(clean_start=false 且同 client_id 会话存在)
+    client.assert(response.body.session_id, "响应包含 session_id");
+    client.global.set("session_id", response.body.session_id);
+%}
+
+### 2. 列出全部会话(调试/管理)
+GET {{host}}/sessions
+
+> {%
+    client.assert(response.status === 200, "OK");
+    // response.sessions: SessionInfo 数组,每项:
+    //   id / client_id / clean_start / online(推送流是否在线)/
+    //   created_at(ISO 时间)/ will_grace_period(生效的遗嘱宽限期)/ subscriptions(订阅表数组)
+%}
+
+### 3. 设置订阅表(按 filter upsert,流存活期间调用立即生效)
+# subscriptions 数组项:
+#   filter  string  主题过滤器,支持 +(单级)、#(多级,须在末尾)、$share/{group}/{filter}(共享订阅)
+#   qos     int     0 或 1;实际投递 QoS 为发布与订阅取小
+PUT {{host}}/sessions/{{session_id}}/subscriptions
+Content-Type: application/json
+
+{
+  "subscriptions": [
+    { "filter": "sensors/+", "qos": 1 },
+    { "filter": "alerts/#", "qos": 0 }
+  ]
+}
+
+> {%
+    client.assert(response.status === 200, "OK");
+    // response.subscriptions: 生效后的完整订阅表(结构同上);
+    // 若推送流在线,新增 filter 匹配到的保留消息会立即补发到流上(retain=true)
+    client.assert(response.body.subscriptions.length === 2, "返回完整订阅表");
+%}
+
+### 4. 查看订阅表
+GET {{host}}/sessions/{{session_id}}/subscriptions
+
+> {%
+    client.assert(response.status === 200, "OK");
+    // response.subscriptions: 当前订阅表数组 [{filter, qos}]
+%}
+
+### 5. 打开 SSE 推送流(长连接,流式响应,非一次性 JSON)
+# 订阅表需先通过请求 3 维护;同一会话同时只允许一条流,重复打开顶掉旧流。
+# 客户端断开即视为异常离线:进入遗嘱宽限期,超时未重连则发布遗嘱。
+# 查询参数 will_grace_period(如 "10s")可选:本次 dial 覆盖会话级遗嘱宽限期。
+GET {{host}}/sessions/{{session_id}}/stream?will_grace_period=10s
+Accept: text/event-stream
+
+# 事件流格式(每个事件 4 行):
+#   id: <message_id>          QoS1 消息 ACK 时引用的 ID
+#   event: message
+#   data: {"message_id","topic","payload","qos","retain"}
+#   (空行)
+# data 字段:qos 为实际投递 QoS;retain=true 表示保留消息补发
+
+### 6. 发布主题消息(无需会话)
+# body 字段:
+#   topic    string  发布主题,不允许通配符
+#   payload  string  消息体
+#   qos      int     0 或 1;1 要求订阅方用请求 7 确认,超时重投
+#   retain   bool    可选;true 存为保留消息,payload 为空则清除该主题保留消息
+POST {{host}}/publish
+Content-Type: application/json
+
+{ "topic": "alerts/temp", "payload": "21.5", "qos": 1 }
+
+> {%
+    client.assert(response.status === 200, "OK");
+    // response 结构:
+    //   message_id string  Broker 级单调递增消息 ID
+    //   delivered  int     实际投递的会话数(共享订阅每组计一份;离线会话不计)
+    client.global.set("message_id", response.body.message_id);
+%}
+
+### 7. 确认 QoS 1 消息(幂等)
+# message_id 取自 SSE 事件的 id 字段;未 ACK 的消息按重投间隔重复推送
+POST {{host}}/sessions/{{session_id}}/acks
+Content-Type: application/json
+
+{ "message_id": "{{message_id}}" }
+
+> {%
+    client.assert(response.status === 204, "确认成功返回 204,无响应体");
+%}
+
+### 8. 删除订阅项(流存活期间调用立即生效)
+# filters: 要删除的过滤器数组
+DELETE {{host}}/sessions/{{session_id}}/subscriptions
+Content-Type: application/json
+
+{ "filters": ["alerts/#"] }
+
+> {%
+    client.assert(response.status === 204, "删除成功返回 204,无响应体");
+%}
+
+### 9. 主动断开推送流
+# 关闭该会话的 SSE 流;会话与订阅表保留,不触发遗嘱
+DELETE {{host}}/sessions/{{session_id}}/stream
+
+> {%
+    client.assert(response.status === 204, "断开成功返回 204,无响应体");
+%}
+
+### 10. 正常断开会话
+# 销毁会话与订阅表,不触发遗嘱
+DELETE {{host}}/sessions/{{session_id}}
+
+> {%
+    client.assert(response.status === 204, "断开成功返回 204,无响应体");
+%}
+
+### 错误约定
+# 所有 4xx 响应体均为 {"error": "<描述>"}:
+#   400 主题/过滤器/qos 非法、body 解析失败
+#   404 session 不存在
+#   409 推送流未打开(DELETE stream 时)
