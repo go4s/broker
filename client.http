@@ -13,6 +13,7 @@
 #   clean_start       bool    可选,默认 true;false 时复用同 client_id 会话保留在服务端的订阅表
 #   will              object  可选,遗嘱消息 {topic, payload, qos, retain},会话异常终止时由 Broker 代发
 #   will_grace_period string  可选,会话级遗嘱宽限期,如 "30s";缺省采用 Broker 预定义设置
+#   heartbeat_interval string  可选,会话级 SSE 心跳间隔,如 "3m";缺省采用会话级缺省值
 POST {{host}}/sessions
 Content-Type: application/json
 
@@ -20,7 +21,8 @@ Content-Type: application/json
   "client_id": "device-1",
   "clean_start": true,
   "will": { "topic": "status/device-1", "payload": "offline", "qos": 0, "retain": true },
-  "will_grace_period": "30s"
+  "will_grace_period": "30s",
+  "heartbeat_interval": "3m"
 }
 
 > {%
@@ -40,13 +42,13 @@ GET {{host}}/sessions
 > {%
     client.assert(response.status === 200, "OK");
     // response.sessions: SessionInfo 数组,每项:
-    //   id / client_id / clean_start / online(推送流是否在线)/
-    //   created_at(ISO 时间)/ will_grace_period(生效的遗嘱宽限期)/ subscriptions(订阅表数组)
+    //   id / client_id / clean_start / online(推送流是否在线)/ created_at(ISO 时间)/
+    //   will_grace_period(生效的遗嘱宽限期)/ heartbeat_interval(生效的心跳间隔)/ subscriptions(订阅表数组)
 %}
 
 ### 3. 设置订阅表(按 filter upsert,流存活期间调用立即生效)
 # subscriptions 数组项:
-#   filter  string  主题过滤器,支持 +(单级)、#(多级,须在末尾)、$share/{group}/{filter}(共享订阅)
+#   filter  string  主题过滤器,支持 +(单级)、#(多级,须在末尾)通配符;不支持共享订阅($share/ 一律 400)
 #   qos     int     0 或 1;实际投递 QoS 为发布与订阅取小
 PUT {{host}}/sessions/{{session_id}}/subscriptions
 Content-Type: application/json
@@ -77,7 +79,9 @@ GET {{host}}/sessions/{{session_id}}/subscriptions
 # 订阅表需先通过请求 3 维护;同一会话同时只允许一条流,重复打开顶掉旧流。
 # 客户端断开即视为异常离线:进入遗嘱宽限期,超时未重连则发布遗嘱。
 # 查询参数 will_grace_period(如 "10s")可选:本次 dial 覆盖会话级遗嘱宽限期。
-GET {{host}}/sessions/{{session_id}}/stream?will_grace_period=10s
+# 查询参数 heartbeat_interval(如 "30s")可选:本次 dial 覆盖会话级心跳间隔。
+# 服务端按生效心跳间隔周期推送 ": ping" 注释行,写失败即判定客户端离线。
+GET {{host}}/sessions/{{session_id}}/stream?will_grace_period=10s&heartbeat_interval=30s
 Accept: text/event-stream
 
 # 事件流格式(每个事件 4 行):
@@ -86,6 +90,8 @@ Accept: text/event-stream
 #   data: {"message_id","topic","payload","qos","retain"}
 #   (空行)
 # data 字段:qos 为实际投递 QoS;retain=true 表示保留消息补发
+# 心跳行格式(单行,可安全忽略):
+#   : ping
 
 ### 6. 发布主题消息(无需会话)
 # body 字段:
@@ -93,6 +99,7 @@ Accept: text/event-stream
 #   payload  string  消息体
 #   qos      int     0 或 1;1 要求订阅方用请求 7 确认,超时重投
 #   retain   bool    可选;true 存为保留消息,payload 为空则清除该主题保留消息
+# 请求体上限 1024 字节,超出返回 413
 POST {{host}}/publish
 Content-Type: application/json
 
@@ -102,7 +109,7 @@ Content-Type: application/json
     client.assert(response.status === 200, "OK");
     // response 结构:
     //   message_id string  Broker 级单调递增消息 ID
-    //   delivered  int     实际投递的会话数(共享订阅每组计一份;离线会话不计)
+    //   delivered  int     实际投递的会话数(离线会话不计)
     client.global.set("message_id", response.body.message_id);
 %}
 
@@ -146,6 +153,8 @@ DELETE {{host}}/sessions/{{session_id}}
 
 ### 错误约定
 # 所有 4xx 响应体均为 {"error": "<描述>"}:
-#   400 主题/过滤器/qos 非法、body 解析失败
+#   400 主题/过滤器/qos/时长参数非法、body 解析失败
 #   404 session 不存在
 #   409 推送流未打开(DELETE stream 时)
+#   413 请求体超过 1024 字节(POST /sessions、POST /publish)
+#   429 会话数达到上限(WithMaxSessions)

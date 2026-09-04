@@ -4,7 +4,7 @@ import "time"
 
 // Subscription 一条订阅关系。
 type Subscription struct {
-	Filter string `json:"filter"` // 主题过滤器,支持 +、# 与 $share/{group}/{filter}
+	Filter string `json:"filter"` // 主题过滤器,支持 + 与 # 通配符
 	QoS    int    `json:"qos"`    // 0 或 1,投递时与发布 QoS 取小
 }
 
@@ -33,6 +33,7 @@ type Session struct {
 
 	will      *Will
 	willGracePeriod time.Duration // 遗嘱宽限期;0 表示未定义,采用 Broker 预定义设置
+	heartbeatInterval time.Duration // SSE 心跳间隔;0 表示未定义,采用 Broker 预定义设置
 	subs      map[string]Subscription // filter -> sub
 	inflight  map[string]*inflightMsg // messageID -> msg
 	stream    chan Event              // 当前推送流,nil 表示离线

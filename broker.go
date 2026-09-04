@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,38 +28,48 @@ type Event struct {
 }
 
 // SessionInfo 会话快照,用于查询接口。
+// defaultSessionHeartbeat 会话级心跳缺省值:创建会话未指定心跳间隔时采用。
+const defaultSessionHeartbeat = 3 * time.Minute
+
 type SessionInfo struct {
-	ID              string         `json:"id"`
-	ClientID        string         `json:"client_id"`
-	CleanStart      bool           `json:"clean_start"`
-	Online          bool           `json:"online"`
-	CreatedAt       time.Time      `json:"created_at"`
-	WillGracePeriod string         `json:"will_grace_period"` // 生效的遗嘱宽限期,如 "30s"
-	Subscriptions   []Subscription `json:"subscriptions"`
+	ID                string         `json:"id"`
+	ClientID          string         `json:"client_id"`
+	CleanStart        bool           `json:"clean_start"`
+	Online            bool           `json:"online"`
+	CreatedAt         time.Time      `json:"created_at"`
+	WillGracePeriod   string         `json:"will_grace_period"`  // 生效的遗嘱宽限期,如 "30s"
+	HeartbeatInterval string         `json:"heartbeat_interval"` // 生效的 SSE 心跳间隔,如 "3m0s"
+	Subscriptions     []Subscription `json:"subscriptions"`
 }
 
 var (
 	ErrSessionNotFound = errors.New("session not found")
 	ErrStreamNotOpen   = errors.New("stream not open")
+	ErrTooManySessions = errors.New("too many sessions")
 )
 
+type ReviewMarkShouldBeRemovedByAI struct{}
+
 // Broker 内存消息 Broker,功能模型类似 MQTT:
-// 通配符订阅、QoS 0/1、保留消息、遗嘱消息、共享订阅。
+// 通配符订阅、QoS 0/1、保留消息、遗嘱消息。
 type Broker struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	byClient map[string]string // clientID -> sessionID
 	retained map[string]Message
-	routes   *routeNode     // 订阅路由树,随订阅增删与会话销毁维护
-	shareRR  map[string]int // shareKey -> 轮询游标
-	seq      atomic.Uint64
+	routes   *routeNode                    // 订阅路由树,随订阅增删与会话销毁维护
+	seq      atomic.Uint64                 // Human : why seq placed here? \
+	_        ReviewMarkShouldBeRemovedByAI // service level publish count should not be used as per-session message id
 
 	streamBuffer      int
 	redeliverInterval time.Duration
 	willGracePeriod   time.Duration
+	heartbeatInterval time.Duration
+	maxSessions       int // 会话数上限,0 表示不限制
 
 	stop   chan struct{}
 	stopWg sync.WaitGroup
+	closed atomic.Bool
 }
 
 // New 创建 Broker 并启动 QoS1 重投循环。
@@ -70,9 +79,10 @@ func New(opts ...Option) *Broker {
 		byClient:          make(map[string]string),
 		retained:          make(map[string]Message),
 		routes:            newRouteNode(),
-		shareRR:           make(map[string]int),
+		streamBuffer:      1,
 		redeliverInterval: 5 * time.Second,
 		willGracePeriod:   30 * time.Second,
+		heartbeatInterval: 10 * time.Minute,
 		stop:              make(chan struct{}),
 	}
 	for _, opt := range opts {
@@ -83,8 +93,11 @@ func New(opts ...Option) *Broker {
 	return b
 }
 
-// Close 停止重投循环并销毁所有会话(不触发遗嘱)。
+// Close 停止重投循环并销毁所有会话(不触发遗嘱)。幂等,可重复调用。
 func (b *Broker) Close() {
+	if !b.closed.CompareAndSwap(false, true) {
+		return
+	}
 	close(b.stop)
 	b.stopWg.Wait()
 	b.mu.Lock()
@@ -96,9 +109,11 @@ func (b *Broker) Close() {
 
 // CreateSession 创建会话。cleanStart=true 时同 clientID 的旧会话被清空重建;
 // cleanStart=false 且旧会话存在时复用其订阅表(resumed=true)。
-// willGracePeriod 为会话级遗嘱宽限期,<=0 表示未定义(采用 Broker 预定义设置);
-// 恢复既有会话时仅在 >0 时覆盖原设置。
-func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, willGracePeriod time.Duration) (info SessionInfo, resumed bool, err error) {
+// willGracePeriod 为会话级遗嘱宽限期,<=0 表示未定义(采用 Broker 预定义设置)。
+// heartbeatInterval 为会话级 SSE 心跳间隔,>0 记入会话,<=0 时新会话取会话级缺省 3min。
+// 恢复既有会话时,两者仅在 >0 时覆盖原设置。
+// 新建会话数达到上限(WithMaxSessions)时返回 ErrTooManySessions;恢复既有会话不受限。
+func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, willGracePeriod, heartbeatInterval time.Duration) (info SessionInfo, resumed bool, err error) {
 	if will != nil {
 		if err := ValidateTopic(will.Topic); err != nil {
 			return SessionInfo{}, false, fmt.Errorf("invalid will topic: %w", err)
@@ -117,6 +132,9 @@ func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, wil
 				if willGracePeriod > 0 {
 					old.willGracePeriod = willGracePeriod
 				}
+				if heartbeatInterval > 0 {
+					old.heartbeatInterval = heartbeatInterval
+				}
 				if old.willTimer != nil {
 					old.willTimer.Stop()
 					old.willTimer = nil
@@ -127,10 +145,18 @@ func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, wil
 			b.destroyLocked(oldID)
 		}
 	}
+	if b.maxSessions > 0 && len(b.sessions) >= b.maxSessions {
+		return SessionInfo{}, false, ErrTooManySessions
+	}
 	id := randomID()
 	s := newSession(id, clientID, cleanStart, will)
 	if willGracePeriod > 0 {
 		s.willGracePeriod = willGracePeriod
+	}
+	if heartbeatInterval > 0 {
+		s.heartbeatInterval = heartbeatInterval
+	} else {
+		s.heartbeatInterval = defaultSessionHeartbeat
 	}
 	b.sessions[id] = s
 	if clientID != "" {
@@ -197,11 +223,7 @@ func (b *Broker) SetSubscriptions(id string, subs []Subscription) error {
 			added = append(added, sub)
 		}
 		s.subs[sub.Filter] = sub
-		sk := ""
-		if _, _, ok := ParseShare(sub.Filter); ok {
-			sk = shareKey(sub.Filter)
-		}
-		b.routes.add(sub.Filter, routeSub{sess: s, qos: sub.QoS, shareKey: sk})
+		b.routes.add(sub.Filter, routeSub{sess: s, qos: sub.QoS})
 	}
 	if s.stream != nil {
 		b.resendRetainedLocked(s, added)
@@ -240,7 +262,8 @@ func (b *Broker) DeleteSubscriptions(id string, filters []string) error {
 // OpenStream 打开会话的推送流。同一会话同时只允许一条流,重复打开会顶掉旧流。
 // 打开时对当前订阅表匹配到的保留消息做一次补发。
 // willGracePeriod 为流级遗嘱宽限期,>0 时覆盖会话级设置,<=0 表示不覆盖。
-func (b *Broker) OpenStream(id string, willGracePeriod time.Duration) (<-chan Event, error) {
+// heartbeatInterval 为流级 SSE 心跳间隔,规则同上。
+func (b *Broker) OpenStream(id string, willGracePeriod, heartbeatInterval time.Duration) (<-chan Event, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.sessions[id]
@@ -255,10 +278,24 @@ func (b *Broker) OpenStream(id string, willGracePeriod time.Duration) (<-chan Ev
 	if willGracePeriod > 0 {
 		s.willGracePeriod = willGracePeriod
 	}
+	if heartbeatInterval > 0 {
+		s.heartbeatInterval = heartbeatInterval
+	}
 	s.stream = make(chan Event, b.streamBuffer)
 	s.Online = true
 	b.resendRetainedLocked(s, s.Subscriptions())
 	return s.stream, nil
+}
+
+// heartbeatOf 返回会话生效的 SSE 心跳间隔:会话/流未定义时回落到 Broker 预定义设置。
+// 会话不存在时返回 Broker 预定义值。
+func (b *Broker) heartbeatOf(id string) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s, ok := b.sessions[id]; ok && s.heartbeatInterval > 0 {
+		return s.heartbeatInterval
+	}
+	return b.heartbeatInterval
 }
 
 // DetachStream 在推送流连接结束时由 HTTP 层调用,标记会话离线并启动遗嘱宽限期。
@@ -326,34 +363,14 @@ func (b *Broker) Publish(msg Message) (messageID string, delivered int, err erro
 	return messageID, delivered, nil
 }
 
-// deliverLocked 通过路由树匹配在线会话并投递,共享订阅组内轮询一份。
+// deliverLocked 通过路由树匹配在线会话并投递。
 func (b *Broker) deliverLocked(messageID string, msg Message, retain bool) int {
-	// 普通订阅:每个会话至多投递一份,QoS 取所有匹配订阅的最大值。
+	// 每个会话至多投递一份,QoS 取所有匹配订阅的最大值。
 	normalQos := make(map[*Session]int)
-	shared := make(map[string][]*Session) // shareKey -> 在线成员
-	sharedQos := make(map[string]int)
-
 	for _, sub := range b.routes.match(msg.Topic) {
 		s := sub.sess
 		if s.stream == nil {
 			continue // 仅投递在线会话
-		}
-		if sub.shareKey != "" {
-			// 去重:同一会话对同一 shareKey 只算一个成员
-			dup := false
-			for _, m := range shared[sub.shareKey] {
-				if m == s {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				shared[sub.shareKey] = append(shared[sub.shareKey], s)
-			}
-			if sub.qos > sharedQos[sub.shareKey] {
-				sharedQos[sub.shareKey] = sub.qos
-			}
-			continue
 		}
 		if qos, ok := normalQos[s]; !ok || sub.qos > qos {
 			normalQos[s] = sub.qos
@@ -363,15 +380,6 @@ func (b *Broker) deliverLocked(messageID string, msg Message, retain bool) int {
 	delivered := 0
 	for s, qos := range normalQos {
 		if b.sendLocked(s, Event{MessageID: messageID, Topic: msg.Topic, Payload: msg.Payload, QoS: min(msg.QoS, qos), Retain: retain}) {
-			delivered++
-		}
-	}
-	for key, members := range shared {
-		// 按会话 ID 排序,保证组内轮询序列稳定
-		sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
-		idx := b.shareRR[key] % len(members)
-		b.shareRR[key]++
-		if b.sendLocked(members[idx], Event{MessageID: messageID, Topic: msg.Topic, Payload: msg.Payload, QoS: min(msg.QoS, sharedQos[key]), Retain: retain}) {
 			delivered++
 		}
 	}
@@ -396,9 +404,6 @@ func (b *Broker) resendRetainedLocked(s *Session, subs []Subscription) {
 	for topic, msg := range b.retained {
 		qos := -1
 		for _, sub := range subs {
-			if _, _, ok := ParseShare(sub.Filter); ok {
-				continue // 共享订阅不补发保留消息
-			}
 			if Match(sub.Filter, topic) && sub.QoS > qos {
 				qos = sub.QoS
 			}
@@ -502,15 +507,25 @@ func (b *Broker) gracePeriodOf(s *Session) time.Duration {
 	return b.willGracePeriod
 }
 
+// heartbeatIntervalOf 返回会话生效的 SSE 心跳间隔:未定义时回落到 Broker 预定义设置。
+// 调用方需持锁。
+func (b *Broker) heartbeatIntervalOf(s *Session) time.Duration {
+	if s.heartbeatInterval > 0 {
+		return s.heartbeatInterval
+	}
+	return b.heartbeatInterval
+}
+
 func (b *Broker) snapshot(s *Session) SessionInfo {
 	return SessionInfo{
-		ID:              s.ID,
-		ClientID:        s.ClientID,
-		CleanStart:      s.CleanStart,
-		Online:          s.Online,
-		CreatedAt:       s.CreatedAt,
-		WillGracePeriod: b.gracePeriodOf(s).String(),
-		Subscriptions:   s.Subscriptions(),
+		ID:                s.ID,
+		ClientID:          s.ClientID,
+		CleanStart:        s.CleanStart,
+		Online:            s.Online,
+		CreatedAt:         s.CreatedAt,
+		WillGracePeriod:   b.gracePeriodOf(s).String(),
+		HeartbeatInterval: b.heartbeatIntervalOf(s).String(),
+		Subscriptions:     s.Subscriptions(),
 	}
 }
 

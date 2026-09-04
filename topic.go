@@ -6,22 +6,16 @@ import (
 	"strings"
 )
 
-const sharePrefix = "$share/"
-
 var (
 	errEmptyFilter = errors.New("topic filter is empty")
 	errEmptyTopic  = errors.New("topic is empty")
 )
 
-// ValidateFilter 校验订阅过滤器:支持 + (单级)与 # (多级,必须在末尾)通配符,
-// 以及 $share/{group}/{filter} 共享订阅前缀。
+// ValidateFilter 校验订阅过滤器:支持 + (单级)与 # (多级,必须在末尾)通配符。
+// 不支持共享订阅,$share/ 前缀一律拒绝。
 func ValidateFilter(filter string) error {
-	if strings.HasPrefix(filter, sharePrefix) {
-		_, inner, ok := ParseShare(filter)
-		if !ok {
-			return fmt.Errorf("invalid shared subscription filter %q", filter)
-		}
-		return validateFilterLevels(inner)
+	if strings.HasPrefix(filter, "$share/") {
+		return fmt.Errorf("shared subscription %q is not supported", filter)
 	}
 	return validateFilterLevels(filter)
 }
@@ -70,12 +64,9 @@ func validateLevels(topic string) error {
 	return nil
 }
 
-// Match 判断过滤器是否匹配主题。$share 前缀在匹配前剥离。
+// Match 判断过滤器是否匹配主题。
 // # 匹配其所在层级及之后所有层级(含零层,+ 恰好匹配一层)。
 func Match(filter, topic string) bool {
-	if _, inner, ok := ParseShare(filter); ok {
-		filter = inner
-	}
 	f := strings.Split(filter, "/")
 	t := strings.Split(topic, "/")
 	for i, lv := range f {
@@ -92,33 +83,10 @@ func Match(filter, topic string) bool {
 	return len(f) == len(t)
 }
 
-// ParseShare 解析 $share/{group}/{filter} 形式的共享订阅过滤器。
-func ParseShare(filter string) (group, inner string, ok bool) {
-	if !strings.HasPrefix(filter, sharePrefix) {
-		return "", "", false
-	}
-	rest := strings.TrimPrefix(filter, sharePrefix)
-	group, inner, found := strings.Cut(rest, "/")
-	if !found || group == "" || inner == "" || strings.ContainsAny(group, "+#") {
-		return "", "", false
-	}
-	if strings.HasPrefix(inner, sharePrefix) {
-		return "", "", false
-	}
-	return group, inner, true
-}
-
-// shareKey 返回共享订阅的分组键(同组同过滤器的成员轮询消费一份消息)。
-func shareKey(filter string) string {
-	group, inner, _ := ParseShare(filter)
-	return group + "\x00" + inner
-}
-
 // routeSub 路由树终端节点上的一条订阅记录。
 type routeSub struct {
-	sess     *Session
-	qos      int
-	shareKey string // 非空表示共享订阅,同 key 组内轮询投递一份
+	sess *Session
+	qos  int
 }
 
 // routeNode 主题路由树节点:按主题层级组织,子节点键为层级名、+ 或 #;
@@ -140,11 +108,8 @@ func routeKey(sessionID, filter string) string {
 	return sessionID + "\x00" + filter
 }
 
-// routeLevels 返回过滤器参与路由的层级;$share 前缀剥离,仅按内部过滤器路由。
+// routeLevels 返回过滤器参与路由的层级。
 func routeLevels(filter string) []string {
-	if _, inner, ok := ParseShare(filter); ok {
-		filter = inner
-	}
 	return strings.Split(filter, "/")
 }
 

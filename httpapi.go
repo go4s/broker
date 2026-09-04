@@ -31,10 +31,11 @@ func (b *Broker) Mount(ir gin.IRouter) {
 }
 
 type createSessionRequest struct {
-	ClientID        string `json:"client_id"`         // 业务侧客户端标识;缺省由服务端生成
-	CleanStart      *bool  `json:"clean_start"`       // 默认 true;false 时复用同 client_id 会话的服务端订阅表
-	Will            *Will  `json:"will"`              // 遗嘱消息,可选
-	WillGracePeriod string `json:"will_grace_period"` // 会话级遗嘱宽限期,如 "30s";缺省用 Broker 预定义设置
+	ClientID          string `json:"client_id"`          // 业务侧客户端标识;缺省由服务端生成
+	CleanStart        *bool  `json:"clean_start"`        // 默认 true;false 时复用同 client_id 会话的服务端订阅表
+	Will              *Will  `json:"will"`               // 遗嘱消息,可选
+	WillGracePeriod   string `json:"will_grace_period"`  // 会话级遗嘱宽限期,如 "30s";缺省用 Broker 预定义设置
+	HeartbeatInterval string `json:"heartbeat_interval"` // 会话级 SSE 心跳间隔,如 "3m";缺省用会话级缺省值
 }
 
 type createSessionResponse struct {
@@ -45,23 +46,29 @@ type createSessionResponse struct {
 }
 
 func (b *Broker) handleCreateSession(c *gin.Context) {
+	limitBody(c)
 	var req createSessionRequest
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
-		abort(c, http.StatusBadRequest, err)
+		abortBind(c, err)
 		return
 	}
 	cleanStart := true
 	if req.CleanStart != nil {
 		cleanStart = *req.CleanStart
 	}
-	grace, err := parseGracePeriod(req.WillGracePeriod)
+	grace, err := parseDuration("will_grace_period", req.WillGracePeriod)
 	if err != nil {
 		abort(c, http.StatusBadRequest, err)
 		return
 	}
-	info, resumed, err := b.CreateSession(req.ClientID, cleanStart, req.Will, grace)
+	heartbeat, err := parseDuration("heartbeat_interval", req.HeartbeatInterval)
 	if err != nil {
 		abort(c, http.StatusBadRequest, err)
+		return
+	}
+	info, resumed, err := b.CreateSession(req.ClientID, cleanStart, req.Will, grace, heartbeat)
+	if err != nil {
+		abort(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusCreated, createSessionResponse{
@@ -142,15 +149,21 @@ func (b *Broker) handleDeleteSubscriptions(c *gin.Context) {
 }
 
 // handleStream 打开 SSE 推送流:订阅表需先通过 HTTP 维护;断开即视为异常离线。
-// 查询参数 will_grace_period(如 "30s")在本次 dial 覆盖会话级遗嘱宽限期。
+// 查询参数 will_grace_period / heartbeat_interval(如 "30s"/"5s")在本次 dial 覆盖会话级设置。
+// 按生效心跳间隔周期推送 `: ping` 注释行;任何写失败都视为连接已死,立即触发离线判定。
 func (b *Broker) handleStream(c *gin.Context) {
 	id := c.Param("id")
-	grace, err := parseGracePeriod(c.Query("will_grace_period"))
+	grace, err := parseDuration("will_grace_period", c.Query("will_grace_period"))
 	if err != nil {
 		abort(c, http.StatusBadRequest, err)
 		return
 	}
-	ch, err := b.OpenStream(id, grace)
+	heartbeat, err := parseDuration("heartbeat_interval", c.Query("heartbeat_interval"))
+	if err != nil {
+		abort(c, http.StatusBadRequest, err)
+		return
+	}
+	ch, err := b.OpenStream(id, grace, heartbeat)
 	if err != nil {
 		abort(c, statusOf(err), err)
 		return
@@ -164,6 +177,8 @@ func (b *Broker) handleStream(c *gin.Context) {
 	w.WriteHeader(http.StatusOK)
 	w.Flush()
 
+	ticker := time.NewTicker(b.heartbeatOf(id))
+	defer ticker.Stop()
 	for {
 		select {
 		case ev, ok := <-ch:
@@ -174,7 +189,14 @@ func (b *Broker) handleStream(c *gin.Context) {
 			if err != nil {
 				continue
 			}
-			fmt.Fprintf(w, "id: %s\nevent: message\ndata: %s\n\n", ev.MessageID, data)
+			if _, err := fmt.Fprintf(w, "id: %s\nevent: message\ndata: %s\n\n", ev.MessageID, data); err != nil {
+				return // 写失败:连接已死
+			}
+			w.Flush()
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return // 心跳写失败:连接已死,触发离线判定
+			}
 			w.Flush()
 		case <-c.Request.Context().Done():
 			return // 客户端断开
@@ -209,13 +231,14 @@ func (b *Broker) handleAck(c *gin.Context) {
 
 type publishResponse struct {
 	MessageID string `json:"message_id"`
-	Delivered int    `json:"delivered"` // 实际投递的会话数(含共享组每组一份)
+	Delivered int    `json:"delivered"` // 实际投递的会话数
 }
 
 func (b *Broker) handlePublish(c *gin.Context) {
+	limitBody(c)
 	var msg Message
 	if err := c.ShouldBindJSON(&msg); err != nil {
-		abort(c, http.StatusBadRequest, err)
+		abortBind(c, err)
 		return
 	}
 	id, delivered, err := b.Publish(msg)
@@ -230,14 +253,32 @@ func abort(c *gin.Context, status int, err error) {
 	c.AbortWithStatusJSON(status, gin.H{"error": err.Error()})
 }
 
-// parseGracePeriod 解析遗嘱宽限期字符串(如 "30s");空串表示未定义(返回 0)。
-func parseGracePeriod(s string) (time.Duration, error) {
+// maxRequestBytes 携带 payload 的请求体上限,超出返回 413。
+const maxRequestBytes = 1024
+
+// limitBody 限制请求体大小;超限时 JSON 绑定会返回 *http.MaxBytesError。
+func limitBody(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBytes)
+}
+
+// abortBind 按绑定错误类型返回状态码:请求体超限 413,其余 400。
+func abortBind(c *gin.Context, err error) {
+	var mbErr *http.MaxBytesError
+	if errors.As(err, &mbErr) {
+		abort(c, http.StatusRequestEntityTooLarge, mbErr)
+		return
+	}
+	abort(c, http.StatusBadRequest, err)
+}
+
+// parseDuration 解析时长字符串(如 "30s");空串表示未定义(返回 0)。
+func parseDuration(name, s string) (time.Duration, error) {
 	if s == "" {
 		return 0, nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
-		return 0, fmt.Errorf("invalid will_grace_period %q", s)
+		return 0, fmt.Errorf("invalid %s %q", name, s)
 	}
 	return d, nil
 }
@@ -248,6 +289,8 @@ func statusOf(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, ErrStreamNotOpen):
 		return http.StatusConflict
+	case errors.Is(err, ErrTooManySessions):
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusBadRequest
 	}
