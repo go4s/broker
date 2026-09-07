@@ -153,7 +153,17 @@ DELETE {{host}}/sessions/{{session_id}}
 ### 错误约定
 # 所有 4xx 响应体均为 {"error": "<描述>"}:
 #   400 主题/过滤器/qos/时长参数非法、body 解析失败
+#   401 启用 ACL 但请求未注入身份(identity 为空)
+#   403 已注入身份但无发布/订阅权限(Authorizer 拒绝)
 #   404 session 不存在
 #   409 推送流未打开(DELETE stream 时)
 #   413 请求体超过 1024 字节(POST /sessions、POST /publish)
 #   429 会话数达到上限(WithMaxSessions)
+
+### ACL 说明(示例服务启用)
+# 示例服务例用鉴权中间件从 X-User / X-Roles 请求头解析身份注入:
+#   - 未携带 X-User 时,受保护操作(发布/订阅)返回 401
+#   - 示例规则默认拒绝,仅放行 sensors/+ 订阅、sensors/# 发布、alerts/# 订阅、alerts/+ 发布
+#   - 伪造一次带身份的发布: curl -XPOST localhost:8080/publish \
+#       -H 'X-User: god2' \
+#       -d '{"topic":"alerts/temp","payload":"21.5","qos":0}'

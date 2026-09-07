@@ -67,6 +67,9 @@ type Broker struct {
 	heartbeatInterval time.Duration
 	maxSessions       int // 会话数上限,0 表示不限制
 
+	// authorizer 订阅/发布授权器;nil 表示不启用 ACL(向后兼容,默认放行)。
+	authorizer Authorizer
+
 	stop   chan struct{}
 	stopWg sync.WaitGroup
 	closed atomic.Bool
@@ -199,14 +202,18 @@ func (b *Broker) CloseSession(id string) error {
 }
 
 // SetSubscriptions 为会话新增/更新订阅(按 filter upsert),立即生效。
+// 若启用 ACL,逐一校验 identity 对 filter 的订阅权限,任一被拒则整体拒绝(ErrForbidden)。
 // 若会话流在线,对新增 filter 匹配到的保留消息立即补发。
-func (b *Broker) SetSubscriptions(id string, subs []Subscription) error {
+func (b *Broker) SetSubscriptions(id string, subs []Subscription, identity Identity) error {
 	for _, sub := range subs {
 		if err := ValidateFilter(sub.Filter); err != nil {
 			return err
 		}
 		if sub.QoS < 0 || sub.QoS > 1 {
 			return fmt.Errorf("invalid subscription qos %d", sub.QoS)
+		}
+		if err := b.authorizeSubscribe(identity, sub.Filter); err != nil {
+			return err
 		}
 	}
 	b.mu.Lock()
@@ -342,12 +349,16 @@ func (b *Broker) Ack(id, messageID string) error {
 
 // Publish 发布主题消息。返回消息 ID 与实际投递的会话数。
 // 仅投递给当前流在线的会话;离线会话的消息直接丢弃。
-func (b *Broker) Publish(msg Message) (messageID string, delivered int, err error) {
+// 若启用 ACL,发布前校验 identity 对该 topic 的发布权限,被拒返回 ErrForbidden。
+func (b *Broker) Publish(msg Message, identity Identity) (messageID string, delivered int, err error) {
 	if err := ValidateTopic(msg.Topic); err != nil {
 		return "", 0, err
 	}
 	if msg.QoS < 0 || msg.QoS > 1 {
 		return "", 0, fmt.Errorf("invalid publish qos %d", msg.QoS)
+	}
+	if err := b.authorizePublish(identity, msg.Topic); err != nil {
+		return "", 0, err
 	}
 	messageID = fmt.Sprint(b.seq.Add(1))
 	b.mu.Lock()
@@ -530,6 +541,22 @@ func (b *Broker) snapshot(s *Session) SessionInfo {
 		HeartbeatInterval: b.heartbeatIntervalOf(s).String(),
 		Subscriptions:     s.Subscriptions(),
 	}
+}
+
+// authorizePublish 校验发布权限;未启用 ACL 时默认放行。
+func (b *Broker) authorizePublish(identity Identity, topic string) error {
+	if b.authorizer == nil {
+		return nil
+	}
+	return b.authorizer.AuthorizePublish(identity, topic)
+}
+
+// authorizeSubscribe 校验订阅权限;未启用 ACL 时默认放行。
+func (b *Broker) authorizeSubscribe(identity Identity, filter string) error {
+	if b.authorizer == nil {
+		return nil
+	}
+	return b.authorizer.AuthorizeSubscribe(identity, filter)
 }
 
 func randomID() string {

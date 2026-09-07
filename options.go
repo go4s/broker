@@ -55,3 +55,12 @@ func WithWillGracePeriod(d time.Duration) Option {
 		}
 	}
 }
+
+// WithAuthorizer 设置订阅/发布授权器。nil(缺省)表示不启用 ACL,
+// 所有发布与订阅一律放行(向后兼容);启用后按 Authorizer 判定,默认拒绝语义由实现决定。
+// 身份来自 HTTP 层的 gin 中间件注入,由 Authorizer 校验。
+func WithAuthorizer(a Authorizer) Option {
+	return func(b *Broker) {
+		b.authorizer = a
+	}
+}

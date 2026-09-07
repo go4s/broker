@@ -11,6 +11,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// IdentityKey 默认把主体身份注入 gin.Context 的键。
+// 接入方可在中间件里调用 SetIdentity(c, id) 写入;启用 ACL 时本包读取。
+const IdentityKey = "broker.identity"
+
+// SetIdentity 把身份写入 gin.Context,供本包读取。通常在接入方的鉴权中间件里调用。
+func SetIdentity(c *gin.Context, id Identity) {
+	c.Set(IdentityKey, id)
+}
+
+// identityOf 从 gin.Context 读取身份;未注入或 ID 为空时返回 false。
+func identityOf(c *gin.Context) (Identity, bool) {
+	v, ok := c.Get(IdentityKey)
+	if !ok {
+		return Identity{}, false
+	}
+	id, ok := v.(Identity)
+	return id, ok && id.ID != ""
+}
+
 // Mount 把全部功能 API 注册到 gin 路由上,可传入 router 或 group:
 //
 //	b := broker.New()
@@ -114,7 +133,11 @@ func (b *Broker) handlePutSubscriptions(c *gin.Context) {
 		abort(c, http.StatusBadRequest, errors.New("subscriptions must not be empty"))
 		return
 	}
-	if err := b.SetSubscriptions(c.Param("id"), req.Subscriptions); err != nil {
+	identity, ok := b.identityOr401(c)
+	if !ok {
+		return
+	}
+	if err := b.SetSubscriptions(c.Param("id"), req.Subscriptions, identity); err != nil {
 		abort(c, statusOf(err), err)
 		return
 	}
@@ -241,9 +264,13 @@ func (b *Broker) handlePublish(c *gin.Context) {
 		abortBind(c, err)
 		return
 	}
-	id, delivered, err := b.Publish(msg)
+	identity, ok := b.identityOr401(c)
+	if !ok {
+		return
+	}
+	id, delivered, err := b.Publish(msg, identity)
 	if err != nil {
-		abort(c, http.StatusBadRequest, err)
+		abort(c, statusOf(err), err)
 		return
 	}
 	c.JSON(http.StatusOK, publishResponse{MessageID: id, Delivered: delivered})
@@ -283,8 +310,26 @@ func parseDuration(name, s string) (time.Duration, error) {
 	return d, nil
 }
 
+// identityOr401 读取身份;启用 ACL 但未注入身份时返回 401。
+// 未启用 ACL(未配置 Authorizer)时放行,身份可空。
+func (b *Broker) identityOr401(c *gin.Context) (Identity, bool) {
+	if b.authorizer == nil {
+		return Identity{}, true
+	}
+	id, ok := identityOf(c)
+	if !ok {
+		abort(c, http.StatusUnauthorized, ErrUnauthorized)
+		return Identity{}, false
+	}
+	return id, true
+}
+
 func statusOf(err error) int {
 	switch {
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrForbidden):
+		return http.StatusForbidden
 	case errors.Is(err, ErrSessionNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrStreamNotOpen):

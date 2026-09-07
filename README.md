@@ -78,6 +78,34 @@ data: {"message_id":"1","topic":"sensors/temp","payload":"21.5","qos":1,"retain"
 - SSE 心跳三级生效:打开流 `?heartbeat_interval=`(流级)→ 创建会话 `heartbeat_interval`(会话级,缺省 3min)→ Broker 预定义值(默认 10min,`WithHeartbeatInterval`)
 - 携带 payload 的请求体上限 1024 字节,超出返回 413
 
+## 鉴权与 ACL
+
+身份由接入方的 gin 中间件解析并注入(Cookie/JWT/Header 均可),本包只依据它授权。
+启用 ACL 后发布(`POST /publish`)与订阅(`PUT .../subscriptions`)两处强制执行,默认拒绝语义由实现决定。
+
+```go
+// 1. 鉴权中间件:解析请求头为身份,注入 gin.Context
+r.Use(func(c *gin.Context) {
+    broker.SetIdentity(c, broker.Identity{
+        ID:    c.GetHeader("X-User"),
+        Roles: []string{c.GetHeader("X-Role")},
+    })
+    c.Next()
+})
+
+// 2. 配置 Authorizer(随 Broker 创建)
+b := broker.New(broker.WithAuthorizer(broker.NewRuleAuthorizer(
+    broker.Rule{Allow: true, Action: broker.ActionSubscribe, Pattern: "sensors/+"},
+    broker.Rule{Allow: true, Action: broker.ActionPublish, Pattern: "sensors/#"},
+)))
+```
+
+- `Identity`:主体 ID + 可选角色,由中间件注入。
+- `Authorizer`:可插拔接口,实现 `AuthorizePublish(identity, topic)` 与 `AuthorizeSubscribe(identity, filter)`;返回 nil 放行,错误拒绝。
+- `RuleAuthorizer`:内置规则实现,按顺序取首条 身份+资源+操作 都匹配的规则;未匹配或命中拒绝 → 默认拒绝(default-deny)。
+- 未配置 `WithAuthorizer` 时向后兼容,发布/订阅一律放行。
+- 启用 ACL 但请求未注入身份 → 401;身份已注入但被拒 → 403。
+
 ## 测试
 
 ```bash
