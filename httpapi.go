@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +38,7 @@ type createSessionRequest struct {
 	Will              *Will  `json:"will"`               // 遗嘱消息,可选
 	WillGracePeriod   string `json:"will_grace_period"`  // 会话级遗嘱宽限期,如 "30s";缺省用 Broker 预定义设置
 	HeartbeatInterval string `json:"heartbeat_interval"` // 会话级 SSE 心跳间隔,如 "3m";缺省用会话级缺省值
+	MaxInflight       *int   `json:"max_inflight"`       // 会话级 QoS1 in-flight 窗口;缺省用 Broker 预定义值
 }
 
 type createSessionResponse struct {
@@ -66,7 +69,15 @@ func (b *Broker) handleCreateSession(c *gin.Context) {
 		abort(c, http.StatusBadRequest, err)
 		return
 	}
-	info, resumed, err := b.CreateSession(req.ClientID, cleanStart, req.Will, grace, heartbeat)
+	maxInflight := 0
+	if req.MaxInflight != nil {
+		if *req.MaxInflight <= 0 {
+			abort(c, http.StatusBadRequest, fmt.Errorf("invalid max_inflight %d", *req.MaxInflight))
+			return
+		}
+		maxInflight = *req.MaxInflight
+	}
+	info, resumed, err := b.CreateSession(req.ClientID, cleanStart, req.Will, grace, heartbeat, maxInflight)
 	if err != nil {
 		abort(c, statusOf(err), err)
 		return
@@ -168,6 +179,16 @@ func (b *Broker) handleStream(c *gin.Context) {
 		abort(c, statusOf(err), err)
 		return
 	}
+
+	// 兜底回收:无论正常返回、客户端断开还是 handler panic,都确保会话先被 DetachStream
+	// 回收(触发遗嘱宽限期),再吞掉 panic 记录日志——即使接入方未挂 Recovery 中间件,
+	// 单条 SSE 流的 panic 也不会拖垮整个进程,也不会留下"僵尸在线会话"。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("broker: sse stream panic session=%s: %v\n%s", id, r, debug.Stack())
+			_ = b.CloseStream(id) // 会话仍在时强制下线;已被 DetachStream 回收则静默忽略
+		}
+	}()
 	defer b.DetachStream(id, ch)
 
 	w := c.Writer

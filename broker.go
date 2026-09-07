@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,7 @@ type SessionInfo struct {
 	CreatedAt         time.Time      `json:"created_at"`
 	WillGracePeriod   string         `json:"will_grace_period"`  // 生效的遗嘱宽限期,如 "30s"
 	HeartbeatInterval string         `json:"heartbeat_interval"` // 生效的 SSE 心跳间隔,如 "3m0s"
+	MaxInflight       int            `json:"max_inflight"`       // 会话级 QoS1 in-flight 窗口
 	Subscriptions     []Subscription `json:"subscriptions"`
 }
 
@@ -57,15 +60,15 @@ type Broker struct {
 	sessions map[string]*Session
 	byClient map[string]string // clientID -> sessionID
 	retained map[string]Message
-	routes   *routeNode                    // 订阅路由树,随订阅增删与会话销毁维护
-	seq      atomic.Uint64                 // Human : why seq placed here? \
-	_        ReviewMarkShouldBeRemovedByAI // service level publish count should not be used as per-session message id
+	routes   *routeNode // 订阅路由树,随订阅增删与会话销毁维护
+	seq      atomic.Uint64
 
 	streamBuffer      int
 	redeliverInterval time.Duration
 	willGracePeriod   time.Duration
 	heartbeatInterval time.Duration
 	maxSessions       int // 会话数上限,0 表示不限制
+	maxInflight       int // 每会话 QoS1 in-flight 窗口上限,满则拒绝新投递并记录日志
 
 	stop   chan struct{}
 	stopWg sync.WaitGroup
@@ -83,6 +86,7 @@ func New(opts ...Option) *Broker {
 		redeliverInterval: 5 * time.Second,
 		willGracePeriod:   30 * time.Second,
 		heartbeatInterval: 10 * time.Minute,
+		maxInflight:       16,
 		stop:              make(chan struct{}),
 	}
 	for _, opt := range opts {
@@ -111,9 +115,10 @@ func (b *Broker) Close() {
 // cleanStart=false 且旧会话存在时复用其订阅表(resumed=true)。
 // willGracePeriod 为会话级遗嘱宽限期,<=0 表示未定义(采用 Broker 预定义设置)。
 // heartbeatInterval 为会话级 SSE 心跳间隔,>0 记入会话,<=0 时新会话取会话级缺省 3min。
-// 恢复既有会话时,两者仅在 >0 时覆盖原设置。
+// maxInflight 为会话级 QoS1 in-flight 窗口,<=0 时采用 Broker 预定义值(WithMaxInflight)。
+// 恢复既有会话时,三者仅在 >0 时覆盖原设置。
 // 新建会话数达到上限(WithMaxSessions)时返回 ErrTooManySessions;恢复既有会话不受限。
-func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, willGracePeriod, heartbeatInterval time.Duration) (info SessionInfo, resumed bool, err error) {
+func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, willGracePeriod, heartbeatInterval time.Duration, maxInflight int) (info SessionInfo, resumed bool, err error) {
 	if will != nil {
 		if err := ValidateTopic(will.Topic); err != nil {
 			return SessionInfo{}, false, fmt.Errorf("invalid will topic: %w", err)
@@ -135,6 +140,9 @@ func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, wil
 				if heartbeatInterval > 0 {
 					old.heartbeatInterval = heartbeatInterval
 				}
+				if maxInflight > 0 {
+					old.maxInflight = maxInflight
+				}
 				if old.willTimer != nil {
 					old.willTimer.Stop()
 					old.willTimer = nil
@@ -149,7 +157,11 @@ func (b *Broker) CreateSession(clientID string, cleanStart bool, will *Will, wil
 		return SessionInfo{}, false, ErrTooManySessions
 	}
 	id := randomID()
-	s := newSession(id, clientID, cleanStart, will)
+	inflightCap := maxInflight
+	if inflightCap <= 0 {
+		inflightCap = b.maxInflight
+	}
+	s := newSession(id, clientID, cleanStart, will, inflightCap)
 	if willGracePeriod > 0 {
 		s.willGracePeriod = willGracePeriod
 	}
@@ -309,7 +321,7 @@ func (b *Broker) DetachStream(id string, ch <-chan Event) {
 	}
 	s.stream = nil
 	s.Online = false
-	s.inflight = make(map[string]*inflightMsg)
+	s.inflight.reset()
 	s.willTimer = time.AfterFunc(b.gracePeriodOf(s), func() { b.onGraceExpired(id) })
 }
 
@@ -328,15 +340,20 @@ func (b *Broker) CloseStream(id string) error {
 	return nil
 }
 
-// Ack 确认一条 QoS 1 消息,幂等。
+// Ack 批量确认一条 QoS 1 消息:确认 N 即视为该会话 N 及之前投递的全部消息
+// 均已收到,整个出队移出 in-flight 窗口。幂等;ID 非数值视为非法参数报错。
 func (b *Broker) Ack(id, messageID string) error {
+	n, err := strconv.ParseUint(messageID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid message id %q: %v", messageID, err)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.sessions[id]
 	if !ok {
 		return ErrSessionNotFound
 	}
-	delete(s.inflight, messageID)
+	s.inflight.ackUpTo(n)
 	return nil
 }
 
@@ -386,12 +403,31 @@ func (b *Broker) deliverLocked(messageID string, msg Message, retain bool) int {
 	return delivered
 }
 
-// sendLocked 非阻塞投递;QoS1 记入 in-flight 待重投。缓冲满则丢弃。
+// sendLocked 非阻塞投递;QoS1 记入 in-flight 环形窗口待重投。缓冲满则丢弃。
+// QoS1 窗口达上限时拒绝写入:不投递、不入队,记录消息 ID 与丢弃原因
+// (missed Ack 过多时保护内存,窗口随批量 ACK 释放)。
 func (b *Broker) sendLocked(s *Session, ev Event) bool {
+	var id uint64
+	if ev.QoS == 1 {
+		parsed, err := strconv.ParseUint(ev.MessageID, 10, 64)
+		if err != nil {
+			log.Printf("broker: qos1 message dropped: session=%s msgID=%s reason=invalid message id: %v",
+				s.ID, ev.MessageID, err)
+			return false
+		}
+		id = parsed
+		if s.inflight.full() {
+			log.Printf("broker: qos1 message dropped: session=%s msgID=%s reason=inflight window full (%d/%d)",
+				s.ID, ev.MessageID, s.inflight.len(), s.maxInflight)
+			return false
+		}
+	}
 	select {
 	case s.stream <- ev:
 		if ev.QoS == 1 {
-			s.inflight[ev.MessageID] = &inflightMsg{event: ev, sent: time.Now()}
+			if !s.inflight.push(inflightMsg{id: id, event: ev, sent: time.Now()}) {
+				log.Printf("broker: qos1 message queue full: session=%s msgID=%s reason=inflight unintended overflow", s.ID, ev.MessageID)
+			}
 		}
 		return true
 	default:
@@ -450,7 +486,7 @@ func (b *Broker) closeStreamLocked(s *Session) {
 		s.stream = nil
 	}
 	s.Online = false
-	s.inflight = make(map[string]*inflightMsg)
+	s.inflight.reset()
 }
 
 // destroyLocked 销毁会话,不触发遗嘱。
@@ -487,7 +523,8 @@ func (b *Broker) redeliverLoop() {
 				if s.stream == nil {
 					continue
 				}
-				for _, im := range s.inflight {
+				for i := 0; i < s.inflight.len(); i++ {
+					im := s.inflight.at(i)
 					if now.Sub(im.sent) >= b.redeliverInterval {
 						select {
 						case s.stream <- im.event:
@@ -528,6 +565,7 @@ func (b *Broker) snapshot(s *Session) SessionInfo {
 		CreatedAt:         s.CreatedAt,
 		WillGracePeriod:   b.gracePeriodOf(s).String(),
 		HeartbeatInterval: b.heartbeatIntervalOf(s).String(),
+		MaxInflight:       s.maxInflight,
 		Subscriptions:     s.Subscriptions(),
 	}
 }

@@ -34,6 +34,18 @@ func WithMaxSessions(n int) Option {
 	}
 }
 
+// WithMaxInflight 设置每个会话的 QoS1 in-flight 窗口缺省值,默认 16。
+// 会话创建时可经 CreateSession 的 maxInflight 参数覆盖(<=0 时回落此缺省值)。
+// 达到上限时新的 QoS1 消息对该会话拒绝投递(缓冲丢弃并记录消息 ID 与原因),
+// 窗口随批量 ACK 释放。
+func WithMaxInflight(n int) Option {
+	return func(b *Broker) {
+		if n > 0 {
+			b.maxInflight = n
+		}
+	}
+}
+
 // WithHeartbeatInterval 设置 SSE 心跳间隔的 Broker 级预定义值,默认 10min。
 // 会话创建时未指定心跳则取会话级缺省 3min;打开推送流时可再覆盖。
 // 心跳写失败即判定客户端离线。

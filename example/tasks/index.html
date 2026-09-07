@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>broker 任务进度示例</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  .status { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 13px; margin-bottom: 1rem; }
+  .status.ready { background: #e6f4ea; color: #137333; }
+  .status.wait { background: #fef7e0; color: #b06000; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .row { display: flex; align-items: center; gap: .5rem; }
+  .bar { flex: 1; height: 14px; background: #eee; border-radius: 7px; overflow: hidden; }
+  .fill { height: 100%; width: 0%; background: #1a73e8; transition: width .2s; }
+  .stage { font-weight: 600; min-width: 6em; }
+  .pct { min-width: 3.5em; text-align: right; }
+  #log { font: 12px/1.6 monospace; background: #f6f6f6; border-radius: 8px; padding: .6rem .8rem; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+  button { padding: .5rem 1.2rem; border: none; border-radius: 6px; background: #1a73e8; color: #fff; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #bbb; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<h2>broker 任务进度</h2>
+<span id="status" class="status wait">正在订阅…</span>
+<div class="card">
+  <div class="row">
+    <span class="stage" id="stage">-</span>
+    <div class="bar"><div id="fill" class="fill"></div></div>
+    <span class="pct" id="pct">0%</span>
+  </div>
+  <div id="task" style="margin-top:.5rem; color:#666; font-size:13px;">未启动任务</div>
+</div>
+<button id="start">启动任务</button>
+<div style="margin:1rem 0 .4rem; font-size:13px; color:#666;">事件日志</div>
+<div id="log"></div>
+
+<script>
+// ---------- 1. 进入页面自动订阅:建会话 → 订阅 tasks/# → 打开 SSE 流 ----------
+var SID = "";
+var es = null;
+
+function log(line) {
+  var el = document.getElementById("log");
+  var ts = new Date().toLocaleTimeString();
+  el.textContent += "[" + ts + "] " + line + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function ack(msgID) { // QoS1 关键节点确认:ack N 同时确认之前全部(批量语义)
+  fetch("/sessions/" + SID + "/acks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message_id: msgID })
+  }).catch(function(){});
+}
+
+function render(info) {
+  document.getElementById("stage").textContent = info.stage;
+  document.getElementById("pct").textContent = info.progress + "%";
+  document.getElementById("fill").style.width = info.progress + "%";
+  document.getElementById("task").textContent = "任务 " + info.task_id + " (" + info.name + ") " + info.status;
+  if (info.status === "done") {
+    document.getElementById("stage").textContent = "✓ " + info.stage + " · 完成";
+    document.getElementById("start").disabled = false;
+  } else {
+    document.getElementById("start").disabled = true;
+  }
+}
+
+function subscribe() {
+  fetch("/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clean_start: true })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(out) {
+    SID = out.session_id;
+    return fetch("/sessions/" + SID + "/subscriptions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscriptions: [{ filter: "tasks/#", qos: 1 }] })
+    });
+  })
+  .then(function() {
+    es = new EventSource("/sessions/" + SID + "/stream");
+    // broker 推送:进行中任务增量,或已完成任务的终态(retain 补发)
+    es.onmessage = function(ev) {
+      var msg = JSON.parse(ev.data);          // broker Event: {message_id,topic,payload,qos,retain}
+      var info = JSON.parse(msg.payload);     // task.go TaskInfo
+      log("topic=" + msg.topic + " qos=" + msg.qos + (msg.retain ? " retain" : "")
+          + " → " + info.stage + " " + info.progress + "%");
+      render(info);
+      if (msg.qos === 1) ack(ev.lastEventId || msg.message_id); // 关键节点,回 ACK
+    };
+    es.onopen = function() {
+      var st = document.getElementById("status");
+      st.textContent = "已订阅 · 等待推送";
+      st.className = "status ready";
+    };
+    es.onerror = function() {
+      var st = document.getElementById("status");
+      st.textContent = "流已断开 · 尝试重连…";
+      st.className = "status wait";
+    };
+    // 进入页面回显当前正在执行的任务
+    return fetch("/tasks/current");
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(cur) {
+    if (cur && cur.task_id) render(cur);
+  })
+  .catch(function(err){ log("订阅失败: " + err); });
+}
+
+// ---------- 2. 启动任务:POST /tasks,后台异步执行并推送进度 ----------
+document.getElementById("start").addEventListener("click", function() {
+  var btn = this;
+  btn.disabled = true;
+  document.getElementById("task").textContent = "任务启动中…";
+  fetch("/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "demo-" + Date.now() })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(out) {
+    log("已启动任务 " + out.task_id);
+  })
+  .catch(function(err){ log("启动失败: " + err); btn.disabled = false; });
+});
+
+subscribe();
+</script>
+</body>
+</html>
