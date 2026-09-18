@@ -8,7 +8,7 @@ BIN_DIR   := bin
 CROSS_SDK := /opt/sdk/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-linux-gnu
 CROSS_CC  := $(CROSS_SDK)/bin/aarch64-linux-gnu-gcc
 
-.PHONY: build run vet test cross clean
+.PHONY: build run vet test cross cross-armv6 clean
 
 # 本机构建
 build:
@@ -32,6 +32,11 @@ cross:
 	&& export CC=$(CROSS_CC)                                       \
 	&& CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -gcflags "-N -l" -o $(BIN_DIR)/$(BINARY)-linux-arm64 $(SERVER)
 
+# 交叉构建示例 server(linux/armv6,Raspberry Pi Zero W 等;纯 Go 静态链接,无需外部工具链)
+cross-armv6:
+	mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=6 $(GO) build -o $(BIN_DIR)/$(BINARY)-linux-armv6 $(SERVER)
+
 clean:
 	rm -rf $(BIN_DIR)
 
@@ -41,4 +46,4 @@ image:
 		&& export HTTPS_PROXY=http://192.168.66.170:42059																\
 		&& podman build --network host -t registry.cn-hangzhou.aliyuncs.com/etsme/etslms-broker:${tag} .
 image-push:
-	podman push registry.cn-hangzhou.aliyuncs.com/etsme/local-sms:${tag}
+	podman push registry.cn-hangzhou.aliyuncs.com/etsme/etslms-broker:${tag}

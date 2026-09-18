@@ -1,6 +1,9 @@
 package broker
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Subscription 一条订阅关系。
 type Subscription struct {
@@ -26,8 +29,8 @@ type inflightMsg struct {
 	sent  time.Time
 }
 
-// inflightRing QoS1 待确认窗口:定长数组 + 头/尾指针实现的环形缓冲。
-// 条目按 id 递增从 head 排列到 tail(head 为最老),结构上保证批量 ACK
+// inflightRing QoS1 待确认窗口:定长数组 + head/count 实现的环形缓冲
+// (tail 由 head+count 推导)。条目按 id 递增排列,结构上保证批量 ACK
 // ("ack id=N 即 N 及之前全部收到")只从 head 连续出队;窗口满时由调用方拒绝投递。
 type inflightRing struct {
 	buf   []inflightMsg
@@ -35,12 +38,12 @@ type inflightRing struct {
 	count int // 活跃条目数
 }
 
-// newInflightRing 构造容量为 cap 的空环形缓冲,head/tail 同为 0。
-func newInflightRing(cap int) *inflightRing {
-	if cap <= 0 {
-		cap = 1
+// newInflightRing 构造容量为 capacity 的空环形缓冲。
+func newInflightRing(capacity int) *inflightRing {
+	if capacity <= 0 {
+		capacity = 1
 	}
-	return &inflightRing{buf: make([]inflightMsg, cap)}
+	return &inflightRing{buf: make([]inflightMsg, capacity)}
 }
 
 func (r *inflightRing) len() int { return r.count }
@@ -100,13 +103,14 @@ type Session struct {
 	CreatedAt  time.Time `json:"created_at"`
 
 	will              *Will
-	willGracePeriod   time.Duration           // 遗嘱宽限期;0 表示未定义,采用 Broker 预定义设置
-	heartbeatInterval time.Duration           // SSE 心跳间隔;0 表示未定义,采用 Broker 预定义设置
-	maxInflight       int                     // QoS1 in-flight 窗口,创建时定容环形缓冲;固化后不可变
-	subs              map[string]Subscription // filter -> sub
-	inflight          *inflightRing           // QoS1 待确认环形窗口,容量=maxInflight
-	stream            chan Event              // 当前推送流,nil 表示离线
-	willTimer         *time.Timer
+	willGracePeriod   time.Duration // 遗嘱宽限期;0 表示未定义,采用 Broker 预定义设置
+	heartbeatInterval time.Duration // SSE 心跳间隔;0 表示未定义,采用 Broker 预定义设置
+	// maxInflight QoS1 in-flight 窗口,创建时定容环形缓冲,固化后不可变
+	maxInflight int
+	subs        map[string]Subscription // filter -> sub
+	inflight    *inflightRing           // QoS1 待确认环形窗口,容量=maxInflight
+	stream      chan Event              // 当前推送流,nil 表示离线
+	willTimer   *time.Timer
 }
 
 func newSession(id, clientID string, cleanStart bool, will *Will, maxInflight int) *Session {
@@ -132,4 +136,118 @@ func (s *Session) Subscriptions() []Subscription {
 		out = append(out, sub)
 	}
 	return out
+}
+
+// CreateSessionOptions 创建会话的可选参数;零值字段表示未定义(采用 Broker 级设置)。
+type CreateSessionOptions struct {
+	ClientID   string // 业务侧客户端标识;空则由服务端生成
+	CleanStart bool   // true 时同 ClientID 的旧会话被清空重建
+	Will       *Will  // 遗嘱消息,可选
+	// 会话级遗嘱宽限期;<=0 表示未定义(采用 Broker 预定义设置)
+	WillGracePeriod time.Duration
+	// 会话级 SSE 心跳间隔;>0 记入会话,<=0 时新会话取默认 3min
+	HeartbeatInterval time.Duration
+	// 会话级 QoS1 in-flight 窗口;<=0 时采用 Broker 预定义值
+	MaxInflight int
+}
+
+// CreateSession 创建会话。cleanStart=true 时同 clientID 的旧会话被清空重建;
+// cleanStart=false 且旧会话存在时复用其订阅表(resumed=true)。
+// willGracePeriod / heartbeatInterval / maxInflight 仅在 >0 时覆盖既有会话的设置。
+// 新建会话数达到上限(WithMaxSessions)时返回 ErrTooManySessions;恢复既有会话不受限。
+func (b *Broker) CreateSession(opts CreateSessionOptions) (info SessionInfo, resumed bool, err error) {
+	if opts.Will != nil {
+		if err := ValidateTopic(opts.Will.Topic); err != nil {
+			return SessionInfo{}, false, fmt.Errorf("invalid will topic: %w", err)
+		}
+		if opts.Will.QoS < 0 || opts.Will.QoS > 1 {
+			return SessionInfo{}, false, fmt.Errorf("invalid will qos %d", opts.Will.QoS)
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if opts.ClientID != "" {
+		if oldID, ok := b.byClient[opts.ClientID]; ok {
+			if !opts.CleanStart {
+				return b.resumeLocked(oldID, opts), true, nil
+			}
+			b.destroyLocked(oldID)
+		}
+	}
+	if b.maxSessions > 0 && len(b.sessions) >= b.maxSessions {
+		return SessionInfo{}, false, ErrTooManySessions
+	}
+	id := randomID()
+	inflightCap := opts.MaxInflight
+	if inflightCap <= 0 {
+		inflightCap = b.maxInflight
+	}
+	s := newSession(id, opts.ClientID, opts.CleanStart, opts.Will, inflightCap)
+	if opts.WillGracePeriod > 0 {
+		s.willGracePeriod = opts.WillGracePeriod
+	}
+	if opts.HeartbeatInterval > 0 {
+		s.heartbeatInterval = opts.HeartbeatInterval
+	} else {
+		s.heartbeatInterval = defaultSessionHeartbeat
+	}
+	b.sessions[id] = s
+	if opts.ClientID != "" {
+		b.byClient[opts.ClientID] = id
+	}
+	return b.snapshot(s), false, nil
+}
+
+// resumeLocked 复用既有会话的订阅表(clean_start=false)。调用方需持锁。
+func (b *Broker) resumeLocked(oldID string, opts CreateSessionOptions) SessionInfo {
+	old := b.sessions[oldID]
+	old.will = opts.Will
+	if opts.WillGracePeriod > 0 {
+		old.willGracePeriod = opts.WillGracePeriod
+	}
+	if opts.HeartbeatInterval > 0 {
+		old.heartbeatInterval = opts.HeartbeatInterval
+	}
+	if opts.MaxInflight > 0 {
+		old.maxInflight = opts.MaxInflight
+	}
+	if old.willTimer != nil {
+		old.willTimer.Stop()
+		old.willTimer = nil
+	}
+	b.closeStreamLocked(old)
+	return b.snapshot(old)
+}
+
+// ListSessions 返回全部会话快照。
+func (b *Broker) ListSessions() []SessionInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]SessionInfo, 0, len(b.sessions))
+	for _, s := range b.sessions {
+		out = append(out, b.snapshot(s))
+	}
+	return out
+}
+
+// GetSession 返回单个会话快照。
+func (b *Broker) GetSession(id string) (SessionInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sessions[id]
+	if !ok {
+		return SessionInfo{}, ErrSessionNotFound
+	}
+	return b.snapshot(s), nil
+}
+
+// CloseSession 正常断开:销毁会话,不触发遗嘱。
+func (b *Broker) CloseSession(id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.sessions[id]; !ok {
+		return ErrSessionNotFound
+	}
+	b.destroyLocked(id)
+	return nil
 }

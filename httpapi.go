@@ -33,12 +33,17 @@ func (b *Broker) Mount(ir gin.IRouter) {
 }
 
 type createSessionRequest struct {
-	ClientID          string `json:"client_id"`          // 业务侧客户端标识;缺省由服务端生成
-	CleanStart        *bool  `json:"clean_start"`        // 默认 true;false 时复用同 client_id 会话的服务端订阅表
-	Will              *Will  `json:"will"`               // 遗嘱消息,可选
-	WillGracePeriod   string `json:"will_grace_period"`  // 会话级遗嘱宽限期,如 "30s";缺省用 Broker 预定义设置
-	HeartbeatInterval string `json:"heartbeat_interval"` // 会话级 SSE 心跳间隔,如 "3m";缺省用会话级缺省值
-	MaxInflight       *int   `json:"max_inflight"`       // 会话级 QoS1 in-flight 窗口;缺省用 Broker 预定义值
+	// 业务侧客户端标识;缺省由服务端生成
+	ClientID string `json:"client_id"`
+	// 默认 true;false 时复用同 client_id 会话的服务端订阅表
+	CleanStart *bool `json:"clean_start"`
+	Will       *Will `json:"will"` // 遗嘱消息,可选
+	// 会话级遗嘱宽限期,如 "30s";缺省用 Broker 预定义设置
+	WillGracePeriod string `json:"will_grace_period"`
+	// 会话级 SSE 心跳间隔,如 "3m";缺省用会话级缺省值
+	HeartbeatInterval string `json:"heartbeat_interval"`
+	// 会话级 QoS1 in-flight 窗口;缺省用 Broker 预定义值
+	MaxInflight *int `json:"max_inflight"`
 }
 
 type createSessionResponse struct {
@@ -69,15 +74,19 @@ func (b *Broker) handleCreateSession(c *gin.Context) {
 		abort(c, http.StatusBadRequest, err)
 		return
 	}
-	maxInflight := 0
-	if req.MaxInflight != nil {
-		if *req.MaxInflight <= 0 {
-			abort(c, http.StatusBadRequest, fmt.Errorf("invalid max_inflight %d", *req.MaxInflight))
-			return
-		}
-		maxInflight = *req.MaxInflight
+	maxInflight, err := parsePositiveInt("max_inflight", req.MaxInflight)
+	if err != nil {
+		abort(c, http.StatusBadRequest, err)
+		return
 	}
-	info, resumed, err := b.CreateSession(req.ClientID, cleanStart, req.Will, grace, heartbeat, maxInflight)
+	info, resumed, err := b.CreateSession(CreateSessionOptions{
+		ClientID:          req.ClientID,
+		CleanStart:        cleanStart,
+		Will:              req.Will,
+		WillGracePeriod:   grace,
+		HeartbeatInterval: heartbeat,
+		MaxInflight:       maxInflight,
+	})
 	if err != nil {
 		abort(c, statusOf(err), err)
 		return
@@ -161,7 +170,7 @@ func (b *Broker) handleDeleteSubscriptions(c *gin.Context) {
 
 // handleStream 打开 SSE 推送流:订阅表需先通过 HTTP 维护;断开即视为异常离线。
 // 查询参数 will_grace_period / heartbeat_interval(如 "30s"/"5s")在本次 dial 覆盖会话级设置。
-// 按生效心跳间隔周期推送 `: ping` 注释行;任何写失败都视为连接已死,立即触发离线判定。
+// 按生效心跳间隔周期推送 `: ping`;任何写失败都视为连接已死,立即触发离线判定。
 func (b *Broker) handleStream(c *gin.Context) {
 	id := c.Param("id")
 	grace, err := parseDuration("will_grace_period", c.Query("will_grace_period"))
@@ -302,6 +311,17 @@ func parseDuration(name, s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %s %q", name, s)
 	}
 	return d, nil
+}
+
+// parsePositiveInt 解析可选的整型参数;nil 表示未定义(返回 0),<=0 视为非法。
+func parsePositiveInt(name string, v *int) (int, error) {
+	if v == nil {
+		return 0, nil
+	}
+	if *v <= 0 {
+		return 0, fmt.Errorf("invalid %s %d", name, *v)
+	}
+	return *v, nil
 }
 
 func statusOf(err error) int {

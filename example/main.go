@@ -19,8 +19,7 @@ func main() {
 	defer b.Close()
 
 	r := gin.Default()
-	b.Mount(r) // 或 b.Mount(r.Group("/broker")) 加前缀
-
+	b.Mount(r.Group("sse"))
 	if err := r.Run(); err != nil {
 		log.Fatal(err)
 	}

@@ -1,5 +1,6 @@
 // 任务进度示例:浏览器页面进入即自动订阅 tasks/#,点击"启动任务"后后台异步执行,
-// broker 经 SSE 推送增量进度(qos0)与关键节点消息(qos1,前端回 ACK)以及完成终态(retain)。
+// broker 经 SSE 推送增量进度(qos0)与关键节点消息(qos1,前端回 ACK)
+// 以及完成终态(retain)。
 // 运行:go run ./example/tasks → http://127.0.0.1:8080
 package main
 

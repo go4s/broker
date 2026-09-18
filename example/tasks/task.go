@@ -13,7 +13,8 @@ import (
 	"github.com/go4s/broker"
 )
 
-// stage 一个任务阶段:进入时发一条关键节点(qos1),阶段内 points 为纯百分比增量(qos0)。
+// stage 一个任务阶段:进入时发一条关键节点(qos1),
+// 阶段内 points 为纯百分比增量(qos0)。
 type stage struct {
 	name   string
 	entry  int   // 进入本阶段时的进度(qos1 关键节点,含此条)
@@ -102,7 +103,8 @@ func (m *taskManager) run(req taskRequest) {
 	m.publish(info, true) // 终态:retain=true,晚订阅者也能补发
 }
 
-// publish 把当前进度发布到 tasks/{task_id},按 key/critical 决定 QoS 与 retain。
+// publish 把当前进度发布到 tasks/{task_id};key 为 true 表示关键节点(qos1),
+// 否则为纯百分比增量(qos0);完成态额外置 retain。
 func (m *taskManager) publish(info *TaskInfo, key bool) {
 	payload, err := json.Marshal(info)
 	if err != nil {

@@ -11,7 +11,7 @@ classDiagram
     class Broker {
         +New(opts ...Option) *Broker stat
         +Close()
-        +CreateSession(clientID string, cleanStart bool, will *Will, willGracePeriod, heartbeatInterval time.Duration) (SessionInfo, bool, error)
+        +CreateSession(opts CreateSessionOptions) (SessionInfo, bool, error)
         +ListSessions() []SessionInfo
         +GetSession(id string) (SessionInfo, error)
         +CloseSession(id string) error
@@ -174,6 +174,15 @@ classDiagram
     Authorizer <|.. DenyAllAuthorizer : implements
     RuleAuthorizer "1" o-- "*" Rule : rules
     Rule "1" --> "1" Action : Action
+
+    class CreateSessionOptions {
+        +ClientID string
+        +CleanStart bool
+        +Will *Will
+        +WillGracePeriod time.Duration
+        +HeartbeatInterval time.Duration
+        +MaxInflight int
+    }
 
     class Option {
         <<func type>>
